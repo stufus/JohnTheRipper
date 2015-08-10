@@ -343,12 +343,86 @@ inline void cmp(uint gid,
 		cmp_final(gid, iter, hash, offset_table, hash_table, return_hashes, output, bitmap_dupe);
 }
 
+void set_salt(__constant uchar *salt, __private uint *W, uint key_len, uint salt_len, uint i)
+{
+	if ((key_len & 3) == 0) {
+		W[i + 1] = (((uint)salt[0] << 24) | ((uint)salt[1] << 16) | ((uint)salt[2] << 8) | (uint)salt[3]);
+		W[i + 2] = (((uint)salt[4] << 24) | ((uint)salt[5] << 16) | ((uint)salt[6] << 8) | (uint)salt[7]);
+		W[i + 3] = (((uint)salt[8] << 24) | ((uint)salt[9] << 16) | ((uint)salt[10] << 8) | (uint)salt[11]);
+		W[i + 4] = (((uint)salt[12] << 24) | ((uint)salt[13] << 16) | ((uint)salt[14] << 8) | (uint)salt[15]);
+	}
+	if ((key_len & 3) == 1) {
+		W[i] |= (((uint)salt[0] << 16) | ((uint)salt[1] << 8) | (uint)salt[2]);
+		W[i + 1] = (((uint)salt[3] << 24) | ((uint)salt[4] << 16) | ((uint)salt[5] << 8) | (uint)salt[6]);
+		W[i + 2] = (((uint)salt[7] << 24) | ((uint)salt[8] << 16) | ((uint)salt[9] << 8) | (uint)salt[10]);
+		W[i + 3] = (((uint)salt[11] << 24) | ((uint)salt[12] << 16) | ((uint)salt[13] << 8) | (uint)salt[14]);
+		W[i + 4] = (uint)salt[15] << 24;
+
+	}
+	if ((key_len & 3) == 2) {
+		W[i] |= (((uint)salt[0] << 8) | (uint)salt[1]);
+		W[i + 1] = (((uint)salt[2] << 24) | ((uint)salt[3] << 16) | ((uint)salt[4] << 8) | (uint)salt[5]);
+		W[i + 2] = (((uint)salt[6] << 24) | ((uint)salt[7] << 16) | ((uint)salt[8] << 8) | (uint)salt[9]);
+		W[i + 3] = (((uint)salt[10] << 24) | ((uint)salt[11] << 16) | ((uint)salt[12] << 8) | (uint)salt[13]);
+		W[i + 4] = (((uint)salt[14] << 24) | ((uint)salt[15] << 16));
+
+	}
+	if ((key_len & 3) == 3) {
+		W[i] |= (uint)salt[0];
+		W[i + 1] = (((uint)salt[1] << 24) | ((uint)salt[2] << 16) | ((uint)salt[3] << 8) | (uint)salt[4]);
+		W[i + 2] = (((uint)salt[5] << 24) | ((uint)salt[6] << 16) | ((uint)salt[7] << 8) | (uint)salt[8]);
+		W[i + 3] = (((uint)salt[9] << 24) | ((uint)salt[10] << 16) | ((uint)salt[11] << 8) | (uint)salt[12]);
+		W[i + 4] = (((uint)salt[13] << 24) | ((uint)salt[14] << 16) | ((uint)salt[15] << 8));
+	}
+
+	PUTCHAR_BE(W, (key_len + salt_len), 0x80);
+	W[15] = (key_len + salt_len) << 3;
+}
+
 #define USE_CONST_CACHE \
 	(CONST_CACHE_SIZE >= (NUM_INT_KEYS * 4))
 
-__kernel void sha1(__global uint *keys,
-		  __global uint *index,
-		  __global uint *int_key_loc,
+__kernel void process_keys(__global uint *keys,
+			   __global uint *index,
+			   __global uint *salted_keys) // Not yet salted.
+{
+	uint gid = get_global_id(0);
+	uint base = index[gid];
+	uint len = base & 63;
+	uint W[16] = {0};
+	uint i;
+
+	keys += base >> 6;
+
+	for (i = 0; i < (len+3)/4; i++)
+		W[i] = SWAP32(*keys++);
+
+	for(i = 0; i < 16; i++)
+		salted_keys[i * get_global_size(0) + gid] = W[i];
+}
+__kernel void add_salt(constant unsigned char *salt,
+		       __global uint *index,
+			__global uint *salted_keys) {
+	uint gid = get_global_id(0);
+	uint gws = get_global_size(0);
+	uint len = index[gid] & 63;
+	uint salt_len = salt[16];
+	uint i;
+
+	uint W[16];
+
+	for(i = 0; i < 16; i++)
+		W[i] = salted_keys[i * gws  + gid];
+
+	i = (len + 3) / 4;
+	set_salt(salt, W, len, salt_len, i -1);
+
+	for(i = 0; i < 16; i++)
+		salted_keys[i * gws + gid] = W[i];
+}
+
+__kernel void sha1(__global uint *salted_keys,
+		   __global uint *int_key_loc,
 #if USE_CONST_CACHE
 		  constant
 #else
@@ -358,8 +432,7 @@ __kernel void sha1(__global uint *keys,
 #if USE_CONST_CACHE && gpu_amd(DEVICE_INFO)
 		__attribute__((max_constant_size (NUM_INT_KEYS * 4)))
 #endif
-		 , __global unsigned char *salt,
-		 __global uint *bitmaps,
+		 , __global uint *bitmaps,
 		  __global uint *offset_table,
 		  __global uint *hash_table,
 		  __global uint *return_hashes,
@@ -368,13 +441,14 @@ __kernel void sha1(__global uint *keys,
 {
 	uint i;
 	uint gid = get_global_id(0);
-	uint base = index[gid];
-	uint W[16] = { 0 };
+	uint gws = get_global_size(0);
+	uint W[16];
 	uint temp, A, B, C, D, E;
-	uint len = base & 63;
 	uint hash[5];
 	uint r[16] = {0};
-	unsigned int salt_len = salt[16];
+
+	for(i = 0; i < 16; i++)
+		W[i] = salted_keys[i * gws  + gid];
 
 #if NUM_INT_KEYS > 1 && !IS_STATIC_GPU_MASK
 	uint ikl = int_key_loc[gid];
@@ -418,46 +492,6 @@ __kernel void sha1(__global uint *keys,
 
 	barrier(CLK_LOCAL_MEM_FENCE);
 #endif
-
-	keys += base >> 6;
-
-	for (i = 0; i < (len+3)/4; i++)
-		W[i] = SWAP32(*keys++);
-
-	i--;
-	if ((len & 3) == 0) {
-		W[i + 1] = (((uint)salt[0] << 24) | ((uint)salt[1] << 16) | ((uint)salt[2] << 8) | (uint)salt[3]);
-		W[i + 2] = (((uint)salt[4] << 24) | ((uint)salt[5] << 16) | ((uint)salt[6] << 8) | (uint)salt[7]);
-		W[i + 3] = (((uint)salt[8] << 24) | ((uint)salt[9] << 16) | ((uint)salt[10] << 8) | (uint)salt[11]);
-		W[i + 4] = (((uint)salt[12] << 24) | ((uint)salt[13] << 16) | ((uint)salt[14] << 8) | (uint)salt[15]);
-	}
-	if ((len & 3) == 1) {
-		W[i] |= (((uint)salt[0] << 16) | ((uint)salt[1] << 8) | (uint)salt[2]);
-		W[i + 1] = (((uint)salt[3] << 24) | ((uint)salt[4] << 16) | ((uint)salt[5] << 8) | (uint)salt[6]);
-		W[i + 2] = (((uint)salt[7] << 24) | ((uint)salt[8] << 16) | ((uint)salt[9] << 8) | (uint)salt[10]);
-		W[i + 3] = (((uint)salt[11] << 24) | ((uint)salt[12] << 16) | ((uint)salt[13] << 8) | (uint)salt[14]);
-		W[i + 4] = (uint)salt[15] << 24;
-
-	}
-	if ((len & 3) == 2) {
-		W[i] |= (((uint)salt[0] << 8) | (uint)salt[1]);
-		W[i + 1] = (((uint)salt[2] << 24) | ((uint)salt[3] << 16) | ((uint)salt[4] << 8) | (uint)salt[5]);
-		W[i + 2] = (((uint)salt[6] << 24) | ((uint)salt[7] << 16) | ((uint)salt[8] << 8) | (uint)salt[9]);
-		W[i + 3] = (((uint)salt[10] << 24) | ((uint)salt[11] << 16) | ((uint)salt[12] << 8) | (uint)salt[13]);
-		W[i + 4] = (((uint)salt[14] << 24) | ((uint)salt[15] << 16));
-
-	}
-	if ((len & 3) == 3) {
-		W[i] |= (uint)salt[0];
-		W[i + 1] = (((uint)salt[1] << 24) | ((uint)salt[2] << 16) | ((uint)salt[3] << 8) | (uint)salt[4]);
-		W[i + 2] = (((uint)salt[5] << 24) | ((uint)salt[6] << 16) | ((uint)salt[7] << 8) | (uint)salt[8]);
-		W[i + 3] = (((uint)salt[9] << 24) | ((uint)salt[10] << 16) | ((uint)salt[11] << 8) | (uint)salt[12]);
-		W[i + 4] = (((uint)salt[13] << 24) | ((uint)salt[14] << 16) | ((uint)salt[15] << 8));
-	}
-
-	PUTCHAR_BE(W, (len + salt_len), 0x80);
-	W[15] = (len + salt_len) << 3;
-
 	for (i = 0; i < NUM_INT_KEYS; i++) {
 #if NUM_INT_KEYS > 1
 		PUTCHAR_BE(W, GPU_LOC_0, (int_keys[i] & 0xff));

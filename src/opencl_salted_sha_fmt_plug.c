@@ -61,12 +61,13 @@ john_register_one(&FMT_STRUCT);
 #define BASE64_ALPHABET	  \
 	"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
+static cl_kernel process_keys_kernel, add_salt_kernel;
 static cl_mem pinned_saved_keys, pinned_saved_idx, pinned_int_key_loc;
 static cl_mem buffer_keys, buffer_idx, buffer_int_keys, buffer_int_key_loc;
 static cl_uint *saved_plain, *saved_idx, *saved_int_key_loc;
 static int static_gpu_locations[MASK_FMT_INT_PLHDR];
 
-static cl_mem buffer_offset_table, buffer_hash_table, buffer_return_hashes, buffer_hash_ids, buffer_bitmap_dupe, buffer_bitmaps, buffer_salt;
+static cl_mem buffer_offset_table, buffer_hash_table, buffer_return_hashes, buffer_hash_ids, buffer_bitmap_dupe, buffer_bitmaps, buffer_salt, buffer_salted_keys;
 static OFFSET_TABLE_WORD *offset_table = NULL;
 static cl_uint *loaded_hashes = NULL, num_loaded_hashes, *hash_ids = NULL, *bitmaps = NULL;
 static unsigned int hash_table_size, offset_table_size, shift64_ht_sz, shift64_ot_sz, shift128_ht_sz, shift128_ot_sz;
@@ -142,21 +143,28 @@ struct fmt_main FMT_STRUCT;
 
 static void set_kernel_args_kpc()
 {
-	HANDLE_CLERROR(clSetKernelArg(crypt_kernel, 0, sizeof(buffer_keys), (void *) &buffer_keys), "Error setting argument 1.");
-	HANDLE_CLERROR(clSetKernelArg(crypt_kernel, 1, sizeof(buffer_idx), (void *) &buffer_idx), "Error setting argument 2.");
-	HANDLE_CLERROR(clSetKernelArg(crypt_kernel, 2, sizeof(buffer_int_key_loc), (void *) &buffer_int_key_loc), "Error setting argument 3.");
+	HANDLE_CLERROR(clSetKernelArg(process_keys_kernel, 0, sizeof(buffer_keys), (void *) &buffer_keys), "Error setting argument 1.");
+	HANDLE_CLERROR(clSetKernelArg(process_keys_kernel, 1, sizeof(buffer_idx), (void *) &buffer_idx), "Error setting argument 2.");
+	HANDLE_CLERROR(clSetKernelArg(process_keys_kernel, 2, sizeof(buffer_salted_keys), (void *) &buffer_salted_keys), "Error setting argument 3.");
+
+	HANDLE_CLERROR(clSetKernelArg(add_salt_kernel, 1, sizeof(buffer_idx), (void *) &buffer_idx), "Error setting argument 2.");
+	HANDLE_CLERROR(clSetKernelArg(add_salt_kernel, 2, sizeof(buffer_salted_keys), (void *) &buffer_salted_keys), "Error setting argument 3.");
+
+	HANDLE_CLERROR(clSetKernelArg(crypt_kernel, 0, sizeof(buffer_salted_keys), (void *) &buffer_salted_keys), "Error setting argument 1.");
+	HANDLE_CLERROR(clSetKernelArg(crypt_kernel, 1, sizeof(buffer_int_key_loc), (void *) &buffer_int_key_loc), "Error setting argument 2.");
 }
 
 static void set_kernel_args()
 {
-	HANDLE_CLERROR(clSetKernelArg(crypt_kernel, 3, sizeof(buffer_int_keys), (void *) &buffer_int_keys), "Error setting argument 4.");
-	HANDLE_CLERROR(clSetKernelArg(crypt_kernel, 4, sizeof(buffer_salt), (void *) &buffer_salt), "Error setting argument 5.");
-	HANDLE_CLERROR(clSetKernelArg(crypt_kernel, 5, sizeof(buffer_bitmaps), (void *) &buffer_bitmaps), "Error setting argument 6.");
-	HANDLE_CLERROR(clSetKernelArg(crypt_kernel, 6, sizeof(buffer_offset_table), (void *) &buffer_offset_table), "Error setting argument 7.");
-	HANDLE_CLERROR(clSetKernelArg(crypt_kernel, 7, sizeof(buffer_hash_table), (void *) &buffer_hash_table), "Error setting argument 8.");
-	HANDLE_CLERROR(clSetKernelArg(crypt_kernel, 8, sizeof(buffer_return_hashes), (void *) &buffer_return_hashes), "Error setting argument 9.");
-	HANDLE_CLERROR(clSetKernelArg(crypt_kernel, 9, sizeof(buffer_hash_ids), (void *) &buffer_hash_ids), "Error setting argument 10.");
-	HANDLE_CLERROR(clSetKernelArg(crypt_kernel, 10, sizeof(buffer_bitmap_dupe), (void *) &buffer_bitmap_dupe), "Error setting argument 11.");
+	HANDLE_CLERROR(clSetKernelArg(add_salt_kernel, 0, sizeof(buffer_salt), (void *) &buffer_salt), "Error setting argument 1.");
+
+	HANDLE_CLERROR(clSetKernelArg(crypt_kernel, 2, sizeof(buffer_int_keys), (void *) &buffer_int_keys), "Error setting argument 3.");
+	HANDLE_CLERROR(clSetKernelArg(crypt_kernel, 3, sizeof(buffer_bitmaps), (void *) &buffer_bitmaps), "Error setting argument 4.");
+	HANDLE_CLERROR(clSetKernelArg(crypt_kernel, 4, sizeof(buffer_offset_table), (void *) &buffer_offset_table), "Error setting argument 5.");
+	HANDLE_CLERROR(clSetKernelArg(crypt_kernel, 5, sizeof(buffer_hash_table), (void *) &buffer_hash_table), "Error setting argument 6.");
+	HANDLE_CLERROR(clSetKernelArg(crypt_kernel, 6, sizeof(buffer_return_hashes), (void *) &buffer_return_hashes), "Error setting argument 7.");
+	HANDLE_CLERROR(clSetKernelArg(crypt_kernel, 7, sizeof(buffer_hash_ids), (void *) &buffer_hash_ids), "Error setting argument 8.");
+	HANDLE_CLERROR(clSetKernelArg(crypt_kernel, 8, sizeof(buffer_bitmap_dupe), (void *) &buffer_bitmap_dupe), "Error setting argument 9.");
 }
 
 static void create_clobj_kpc(size_t kpc)
@@ -191,6 +199,9 @@ static void create_clobj_kpc(size_t kpc)
 
 	buffer_int_key_loc = clCreateBuffer(context[gpu_id], CL_MEM_READ_ONLY, sizeof(cl_uint) * kpc, NULL, &ret_code);
 	HANDLE_CLERROR(ret_code, "Error creating buffer argument buffer_int_key_loc.");
+
+	buffer_salted_keys = clCreateBuffer(context[gpu_id], CL_MEM_READ_WRITE, 16 * kpc * sizeof(cl_uint), NULL, &ret_code);
+	HANDLE_CLERROR(ret_code, "Error creating buffer argument buffer_salted_keys.");
 }
 
 static void create_clobj(void)
@@ -258,6 +269,7 @@ static void release_clobj_kpc(void)
 		HANDLE_CLERROR(clReleaseMemObject(buffer_int_key_loc), "Error Releasing buffer_int_key_loc.");
 		HANDLE_CLERROR(clReleaseMemObject(pinned_saved_idx), "Error Releasing pinned_saved_idx.");
 		HANDLE_CLERROR(clReleaseMemObject(pinned_int_key_loc), "Error Releasing pinned_int_key_loc.");
+		HANDLE_CLERROR(clReleaseMemObject(buffer_salted_keys), "Error Releasing buffer_salted_keys.");
 		buffer_idx = 0;
 	}
 }
@@ -359,15 +371,22 @@ static void init_kernel(unsigned int num_ld_hashes, char *bitmap_para)
 	);
 
 	opencl_build(gpu_id, build_opts, 0, NULL);
+
+	process_keys_kernel = clCreateKernel(program[gpu_id], "process_keys", &ret_code);
+	HANDLE_CLERROR(ret_code, "Error creating kernel. Double-check kernel process_keys");
+
+	add_salt_kernel = clCreateKernel(program[gpu_id], "add_salt", &ret_code);
+	HANDLE_CLERROR(ret_code, "Error creating kernel. Double-check kernel add_salt");
+
 	crypt_kernel = clCreateKernel(program[gpu_id], "sha1", &ret_code);
-	HANDLE_CLERROR(ret_code, "Error creating kernel. Double-check kernel name?");
+	HANDLE_CLERROR(ret_code, "Error creating kernel. Double-check kernel sha1");
 }
 
 static void init(struct fmt_main *_self)
 {
 	self = _self;
 	num_loaded_hashes = 0;
-	mask_int_cand_target = 10000;
+	mask_int_cand_target = 100000;
 
 	opencl_prepare_dev(gpu_id);
 
@@ -812,10 +831,12 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 	if (!is_static_gpu_mask)
 		HANDLE_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], buffer_int_key_loc, CL_TRUE, 0, 4 * global_work_size, saved_int_key_loc, 0, NULL, NULL), "failed in clEnqueueWriteBuffer buffer_int_key_loc.");
+	HANDLE_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], process_keys_kernel, 1, NULL, &global_work_size, lws, 0, NULL, NULL), "failed in clEnqueueNDRangeKernel process_keys");
 	keys_changed = 0;
 	}
 
-	HANDLE_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], crypt_kernel, 1, NULL, &global_work_size, lws, 0, NULL, NULL), "failed in clEnqueueNDRangeKernel");
+	HANDLE_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], add_salt_kernel, 1, NULL, &global_work_size, lws, 0, NULL, NULL), "failed in clEnqueueNDRangeKernel add_salt.");
+	HANDLE_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], crypt_kernel, 1, NULL, &global_work_size, lws, 0, NULL, NULL), "failed in clEnqueueNDRangeKernel sha1.");
 
 	HANDLE_CLERROR(clEnqueueReadBuffer(queue[gpu_id], buffer_hash_ids, CL_TRUE, 0, sizeof(cl_uint), hash_ids, 0, NULL, NULL), "failed in reading back num cracked hashes.");
 
