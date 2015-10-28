@@ -425,7 +425,7 @@ static void reset(struct db_main *db)
 		                       ((_SPLIT_KERNEL_IN_USE) ?
 		                        split_events : NULL),
 		                       warn, 1, self, create_clobj,
-		                       release_clobj, sizeof(uint64_t) * 9 * 8, 0);
+		                       release_clobj, sizeof(uint64_t) * 9 * 8, 0, db);
 
 		//Auto tune execution from shared/included code.
 		autotune_run(self, ROUNDS_DEFAULT, 0,

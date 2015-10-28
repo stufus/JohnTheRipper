@@ -92,6 +92,8 @@ static void (*release_clobj)(void);
 static char fmt_base_name[128];
 static size_t gws_limit;
 static int printed_mask;
+static struct db_main *autotune_db;
+static struct db_salt *autotune_salts;
 
 cl_device_id devices[MAX_GPU_DEVICES];
 cl_context context[MAX_GPU_DEVICES];
@@ -1195,7 +1197,7 @@ static cl_ulong gws_test(size_t gws, unsigned int rounds, int sequential_id)
 
 	// Timing run
 	count = kpc;
-	if (self->methods.crypt_all(&count, NULL) < 0) {
+	if (self->methods.crypt_all(&count, autotune_salts) < 0) {
 		runtime = looptime = 0;
 
 		if (options.verbosity > 3)
@@ -1284,7 +1286,8 @@ void opencl_init_auto_setup(int p_default_value, int p_hash_loops,
                             int *p_split_events, const char **p_warnings,
                             int p_main_opencl_event, struct fmt_main *p_self,
                             void (*p_create_clobj)(size_t gws, struct fmt_main *self),
-                            void (*p_release_clobj)(void), int p_buffer_size, size_t p_gws_limit)
+                            void (*p_release_clobj)(void), int p_buffer_size, size_t p_gws_limit,
+                            struct db_main *db)
 {
 	// Initialize events
 	clear_profiling_events();
@@ -1300,6 +1303,8 @@ void opencl_init_auto_setup(int p_default_value, int p_hash_loops,
 	create_clobj = p_create_clobj;
 	release_clobj = p_release_clobj;
 	gws_limit = p_gws_limit;
+	autotune_db = db;
+	autotune_salts = db ? db->salts : NULL;
 }
 
 /*
@@ -1401,7 +1406,7 @@ void opencl_find_best_lws(size_t group_size_limit, int sequential_id,
 	// Warm-up run
 	local_work_size = wg_multiple;
 	count = global_work_size * ocl_v_width;
-	self->methods.crypt_all(&count, NULL);
+	self->methods.crypt_all(&count, autotune_salts);
 
 	// Activate events. Then clear them later.
 	for (i = 0; i < MAX_EVENTS; i++)
@@ -1409,7 +1414,7 @@ void opencl_find_best_lws(size_t group_size_limit, int sequential_id,
 
 	// Timing run
 	count = global_work_size * ocl_v_width;
-	self->methods.crypt_all(&count, NULL);
+	self->methods.crypt_all(&count, autotune_salts);
 
 	HANDLE_CLERROR(clWaitForEvents(1, &benchEvent[main_opencl_event]),
 	               "WaitForEvents failed");
@@ -1459,7 +1464,7 @@ void opencl_find_best_lws(size_t group_size_limit, int sequential_id,
 				multi_profilingEvent[j] = &benchEvent[j];
 
 			count = global_work_size * ocl_v_width;
-			if (self->methods.crypt_all(&count, NULL) < 0) {
+			if (self->methods.crypt_all(&count, autotune_salts) < 0) {
 				startTime = endTime = 0;
 				break;
 			}
